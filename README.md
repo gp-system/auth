@@ -86,6 +86,121 @@ Wrapping that in a `net/http` middleware is a handful of lines; see
 Applications with custom claims write their own `toIdentity` function
 instead of `auth.DefaultIdentity`.
 
+### Social login (goth): a Discord example
+
+`auth` has no opinion on how a caller authenticated, only on what happens
+once they have: sign a token, verify it later. So a third-party login is not
+a feature of this module, it is just a different way of arriving at the same
+`Sign` call. A `goth.User` from
+[markbates/goth](https://github.com/markbates/goth) (Discord, Facebook,
+Google, ~60 others) feeds `NewDefaultClaims`/`Sign` exactly like a
+bcrypt-verified email+password login would.
+
+```sh
+go get github.com/gp-system/auth
+go get github.com/markbates/goth
+```
+
+`goth` becomes **your** project's dependency, not this module's: `auth`'s own
+`go.mod` still requires nothing but `golang-jwt/jwt/v5`.
+
+Register the provider and route the two endpoints. Go 1.22+ route patterns
+are enough, no router library: `req.PathValue("provider")` is one of the
+places `gothic.GetProviderName` already looks.
+
+```go
+package main
+
+import (
+	"net/http"
+	"os"
+
+	"github.com/gorilla/sessions"
+	"github.com/markbates/goth"
+	"github.com/markbates/goth/gothic"
+	"github.com/markbates/goth/providers/discord"
+)
+
+func main() {
+	gothic.Store = sessions.NewCookieStore([]byte(os.Getenv("SESSION_SECRET")))
+
+	goth.UseProviders(
+		discord.New(
+			os.Getenv("DISCORD_CLIENT_ID"),
+			os.Getenv("DISCORD_CLIENT_SECRET"),
+			"http://localhost:8080/auth/discord/callback",
+			discord.ScopeIdentify, discord.ScopeEmail,
+		),
+	)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /auth/{provider}", gothic.BeginAuthHandler)
+	mux.HandleFunc("GET /auth/{provider}/callback", handleCallback)
+	http.ListenAndServe(":8080", mux)
+}
+```
+
+The callback is where `auth` comes in: `gothic.CompleteUserAuth` gives you a
+`goth.User`, you resolve it to your own user record, and from there it is the
+same `NewDefaultClaims`/`Sign`/`NewRefreshToken` sequence as an email+password
+login (`issuer` is the `TokenIssuer` from
+[Issuing and verifying tokens](#issuing-and-verifying-tokens) above).
+
+```go
+func handleCallback(w http.ResponseWriter, r *http.Request) {
+	gothUser, err := gothic.CompleteUserAuth(w, r)
+	if err != nil {
+		http.Error(w, "social login failed", http.StatusUnauthorized)
+		return
+	}
+
+	// Your own persistence, not part of auth or goth: look up by
+	// (gothUser.Provider, gothUser.UserID) first, fall back to
+	// gothUser.Email, otherwise create a new user.
+	user, err := findOrCreateUser(gothUser)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	claims := auth.NewDefaultClaims(cfg, user.ID, user.Username, user.Roles, user.Permissions)
+	token, err := issuer.Sign(claims)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	refresh, err := auth.NewRefreshToken()
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// Store only a hash of refresh against user.ID, same as any other login.
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"accessToken":  token,
+		"refreshToken": refresh,
+	})
+}
+```
+
+Provider-side setup: in the [Discord Developer
+Portal](https://discord.com/developers/applications) (OAuth2 tab) add
+`http://localhost:8080/auth/discord/callback` as a redirect URI, then set
+`DISCORD_CLIENT_ID` and `DISCORD_CLIENT_SECRET` from the same page.
+`SESSION_SECRET` signs the cookie `gothic` keeps the OAuth session in between
+the two requests; treat it like `JWT_SECRET`, per environment, never
+committed. Facebook and Google are the same shape with a different import and
+scopes (`facebook.New(..., "email")`, `google.New(..., "email", "profile")`).
+
+The token that comes out is an ordinary `auth` token: `Identify`, `rbac` and
+`policy` behave exactly as they do everywhere else in this README, because
+nothing downstream knows or cares that a provider was involved.
+
+More info: <https://gpsystem.hu/en/auth/social-standalone> (the full guide,
+with the account-linking rule, the Facebook/Google/Apple variants, and what
+the gpsystem kit generates on top).
+
 ### rbac: role and permission checks
 
 ```go
@@ -143,12 +258,13 @@ runtime authorization outcome.
 ### Standalone net/http example
 
 A complete, runnable example with no gp-system dependency beyond this
-module lives in the gpsystem docs: see the "Using auth standalone" guide at
-`gpsystem-docs/content/en/12.auth/4.standalone.md` (and its Hungarian
-mirror). It shows a hand-written `net/http` middleware built on `Identify`
-and `rbac.CheckRole`, a `policy.Registry` wired by hand, and a non-HTTP
-example (checking a token inside a WebSocket handshake) to demonstrate the
-module has no transport assumptions.
+module lives in the gpsystem docs: see the "Using auth standalone" guide. It
+shows a hand-written `net/http` middleware built on `Identify` and
+`rbac.CheckRole`, a `policy.Registry` wired by hand, and a non-HTTP example
+(checking a token inside a WebSocket handshake) to demonstrate the module has
+no transport assumptions.
+
+More info: <https://gpsystem.hu/en/auth/standalone>
 
 ## Design rules
 
